@@ -2,7 +2,11 @@
 ## RAG, QLoRA e Otimização de Inferência na GPU
 
 > **Declaração:** Partes deste laboratório foram geradas/complementadas com IA, revisadas e validadas por **Andre Lucas Francino Castelo Branco**.
-
+> - codigo foi gerador por IA
+> - decisões do desenvolvimento como a mudança pra sdpa e redução de tokens foi feita por André Lucas
+> - otimização do texto deste readme foi gerado por IA
+> - texto pra rag feito por IA
+> - 
 ---
 
 ## Ambiente de Execução
