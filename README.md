@@ -11,9 +11,9 @@
 |---|---|
 | Plataforma | Google Colab — GPU Tesla T4 (14,6 GB VRAM) |
 | Modelo | TinyLlama/TinyLlama-1.1B-Chat-v1.0 |
-| Quantização | NF4 4-bit (bitsandbytes) |
+| Quantização | NF4 4-bit via bitsandbytes |
 | Framework | PyTorch 2.x + HuggingFace Transformers 4.41+ |
-| Atenção eficiente | SDPA nativo do PyTorch 2.x (equivalente ao FlashAttention-2) |
+| Atenção eficiente | SDPA nativo do PyTorch 2.x |
 
 ---
 
@@ -23,8 +23,8 @@
 
 | Métrica | Valor |
 |---|---|
-| VRAM ocupada após carga do modelo (NF4 4-bit) | **727,2 MB** |
-| VRAM estimada em Float16 (sem quantização) | ~2.200 MB |
+| VRAM ocupada após carga do modelo em 4-bit | **727,2 MB** |
+| VRAM estimada sem quantização (Float16) | ~2.200 MB |
 | Redução pela quantização | **~3×** |
 
 ### Passo 3 vs Passo 4 — Comparativo de Geração
@@ -39,30 +39,35 @@
 | Pico de VRAM (MB) | **5.619,8** | **8.050,3** |
 | Speedup | — | **16,6×** |
 
-> **Nota sobre VRAM:** o pico de VRAM no Passo 4 é maior porque o KV Cache armazena explicitamente os tensores K e V para todos os 5.000 tokens do contexto (~430 MB adicionais). A otimização se expressa principalmente em **velocidade** (16,6× mais rápido) e na **eliminação do crescimento quadrático O(n²) do cálculo de atenção** — que seria o fator de falha em contextos maiores.
-
-> **Nota sobre attn_implementation:** o pacote `flash-attn` falhou na compilação no ambiente Colab. Foi utilizado `attn_implementation='sdpa'` com `enable_mem_efficient_sdp(True)`, que invoca o mesmo algoritmo de tiling em SRAM do FlashAttention-2, disponível nativamente no PyTorch 2.x.
-
 ---
 
-## Como Executar
+## Observações Importantes sobre a Execução
 
-1. Acesse [colab.research.google.com](https://colab.research.google.com)
-2. Faça upload do arquivo `lab10_pipeline_definitivo.ipynb`
-3. Vá em **Runtime → Change runtime type → T4 GPU**
-4. Execute **Runtime → Run all** e aguarde
+### Por que usamos 4.000–5.000 tokens em vez dos 10.000–15.000 do enunciado?
+
+O enunciado pede um contexto de 10.000 a 15.000 tokens, mas durante os testes descobrimos um limitador arquitetural importante: o modelo TinyLlama-1.1B tem uma janela de contexto máxima de **2.048 tokens**, definida no seu arquivo de configuração (`max_position_embeddings: 2048`). Qualquer entrada acima disso faz o modelo entrar em território não treinado, gerando saídas sem sentido — o que pode ser observado na última célula do notebook, onde o texto gerado é repetitivo ("e e e e..."), exatamente por causa disso.
+
+Além disso, quando tentamos rodar o Passo 4 com 12.000 tokens, a GPU entrou em **Out-Of-Memory (OOM)** mesmo com as otimizações ativas — o erro foi:
+```
+OutOfMemoryError: CUDA out of memory. Tried to allocate 17.17 GiB.
+```
+Esse crash é na prática **a demonstração mais concreta do problema descrito no enunciado**: a complexidade O(n²) da atenção padrão tornando inviável processar contextos grandes. Optamos por reduzir para 4.000–5.000 tokens para conseguir completar o benchmark comparativo (Passo 3 vs Passo 4), que é o objetivo central do laboratório.
+
+### Por que usamos `attn_implementation='sdpa'` em vez de `'flash_attention_2'`?
+
+O pacote `flash-attn` precisa ser compilado do zero e falhou no ambiente Colab com erro de build. O `sdpa` (Scaled Dot Product Attention) é a implementação **nativa do PyTorch 2.x** que usa o mesmo algoritmo de tiles em memória SRAM que o FlashAttention-2, com a mesma complexidade O(n) de memória. Para os fins deste laboratório, os dois demonstram o mesmo princípio arquitetural.
 
 ---
 
 ## Análise Arquitetural
 
-### Parte A — Como QLoRA, KV Cache e FlashAttention-2 salvaram o Transformer do colapso de VRAM
+### Parte A — Como QLoRA, KV Cache e FlashAttention salvaram o Transformer do colapso de VRAM
 
-A primeira linha de defesa contra o colapso de VRAM é a quantização QLoRA em 4-bit: ao representar os pesos do modelo em NF4 (NormalFloat4) em vez de Float16, reduzimos o footprint dos parâmetros em aproximadamente 3–4×, liberando cerca de 1,5 GB de VRAM que de outro modo estariam bloqueados pelos pesos do modelo — sem degradação significativa de qualidade, pois os cálculos internos ainda ocorrem em Float16. Com esse espaço criado na memória, o KV Cache entra como segunda otimização crítica: em vez de recalcular os vetores de Query, Key e Value para todos os tokens anteriores a cada novo token gerado (o que nos rendeu 380 segundos para 100 tokens no Passo 3), os tensores K e V são armazenados em memória entre os passos de decodificação, reduzindo cada passo de um forward pass completo sobre N tokens para um forward pass sobre apenas o novo token — comprovado pelo salto de 0,26 para 4,35 tokens/segundo observado no benchmark. Por fim, o FlashAttention-2 (implementado via SDPA do PyTorch 2.x) elimina o gargalo remanescente: a operação de atenção padrão materializa a matriz completa de scores QKᵀ na HBM (memória global da GPU, de acesso lento), exigindo O(n²) de memória por camada e sendo a causa direta do pico de 5.619 MB de VRAM registrado sem otimização; o FA2/SDPA implementa tiling sobre a SRAM (memória on-chip), reduzindo a complexidade de memória da atenção de O(n²) para O(n) e possibilitando escalar para contextos maiores sem crescimento quadrático de memória.
+A primeira coisa que fizemos foi carregar o modelo com quantização QLoRA em 4-bit. Sem isso, o TinyLlama ocuparia cerca de 2.200 MB de VRAM só com os pesos — com a quantização NF4, esse número caiu para 727 MB, liberando espaço essencial para o restante do pipeline. A ideia por trás disso é simples: em vez de guardar cada número do modelo com 16 bits de precisão, guardamos com 4 bits, e só na hora de fazer as contas convertemos de volta para 16 bits. Com a VRAM dos pesos liberada, o próximo problema aparece na fase de geração: sem o KV Cache, o modelo recalcula do zero os vetores de atenção (Q, K e V) para todos os tokens anteriores a cada novo token gerado. Com 4.000 tokens de contexto, isso significa que gerar 100 tokens exigiu 100 passagens completas pelo modelo — o que nos deu 380 segundos para uma tarefa que deveria levar segundos. O KV Cache resolve isso guardando os vetores K e V já calculados e reaproveitando-os nos passos seguintes, o que levou o tempo para 23 segundos — 16,6 vezes mais rápido. Por fim, o FlashAttention (aqui implementado via SDPA do PyTorch) cuida do problema de memória da própria operação de atenção: em vez de montar a matriz inteira de scores de atenção na memória global da GPU (o que cresce com O(n²) conforme o contexto aumenta), ele processa a atenção em blocos menores usando a memória on-chip da GPU, mais rápida e limitada. Foram essas três técnicas juntas que permitiram o pipeline funcionar.
 
-### Parte B — Por que FlashAttention-2 falharia com 2 milhões de tokens e por que a indústria precisa do Mamba
+### Parte B — Por que o FlashAttention falharia com 2 milhões de tokens e por que precisaríamos do Mamba
 
-Ainda que o FlashAttention-2 resolva o problema da memória quadrática da operação de atenção em si, ele não elimina o crescimento **linear** do KV Cache: para cada camada do Transformer, é obrigatório armazenar os vetores K e V de todos os tokens do contexto. Para o TinyLlama (22 camadas, 4 heads KV, dimensão de head 64, Float16), um contexto de 2 milhões de tokens exigiria 2 × 22 × 4 × 64 × 2.000.000 × 2 bytes ≈ **89 GB** apenas para o KV Cache — impossível em qualquer GPU de consumo e inviável em produção para múltiplas requisições simultâneas mesmo em hardware de datacenter moderno. A solução arquitetural são os State Space Models (SSMs) como o Mamba: em vez de calcular atenção entre todos os pares de tokens, o Mamba mantém um **estado recorrente de tamanho fixo** — uma espécie de "memória comprimida" da sequência inteira — atualizado a cada token com operações matriciais seletivas baseadas no mecanismo S4/S6. Isso garante complexidade **O(1) de memória** e O(n) de tempo independentemente do comprimento da sequência, tornando o processamento de milhões de tokens viável com o mesmo footprint de memória de uma sequência curta. O trade-off é real: SSMs perdem a capacidade de recuperação precisa e localizada de tokens específicos do passado distante (ponto forte do mecanismo de atenção), mas para tarefas como sumarização de documentos longos, análise de séries temporais e processamento de sequências genômicas, o Mamba representa a evolução natural dos Transformers quando o contexto cresce além das fronteiras do que qualquer variante de atenção — incluindo a FlashAttention-2 — pode suportar com eficiência de memória.
+Mesmo com FlashAttention resolvendo o crescimento quadrático da atenção, existe outro problema que ele não consegue resolver: o KV Cache cresce de forma linear com o tamanho do contexto. Cada camada do modelo precisa guardar os vetores K e V de todos os tokens que já foram processados. Para um contexto de 2 milhões de tokens no TinyLlama (22 camadas, 4 heads KV, dimensão 64, Float16), só o KV Cache exigiria aproximadamente 89 GB de memória — o que é inviável em qualquer GPU disponível hoje, seja para uso pessoal ou em produção. É por isso que a indústria começou a olhar para arquiteturas diferentes, como o **Mamba**, que pertence à família dos State Space Models (SSMs). A diferença fundamental é que o Mamba não precisa guardar todos os tokens anteriores: ele mantém um **estado interno de tamanho fixo** que vai sendo atualizado a cada novo token, como se fosse uma "memória comprimida" do que já foi processado. Isso faz com que o consumo de memória seja O(1) — ou seja, constante, independente do tamanho do contexto. O preço disso é que o Mamba pode perder informações específicas de tokens muito distantes no passado, o que o torna menos preciso do que a atenção para tarefas que exigem recuperar detalhes exatos. Mas para contextos com milhões de tokens — como análise de documentos inteiros, genomas ou séries temporais longas — o Mamba é hoje a solução arquitetural mais viável.
 
 ---
 
